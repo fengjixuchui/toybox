@@ -27,6 +27,7 @@
  * TODO: getuid() vs geteuid()
  * TODO: test that $PS1 color changes work without stupid \[ \] hack
  * TODO: Handle embedded NUL bytes in the command line? (When/how?)
+ * TODO: set -e -u -o pipefail, shopt -s nullglob
  *
  * bash man page:
  * control operators || & && ; ;; ;& ;;& ( ) | |& <newline>
@@ -45,6 +46,8 @@ USE_SH(NEWTOY(exec, "^cla:", TOYFLAG_NOFORK))
 USE_SH(NEWTOY(exit, 0, TOYFLAG_NOFORK))
 USE_SH(NEWTOY(export, "np", TOYFLAG_NOFORK))
 USE_SH(NEWTOY(shift, ">1", TOYFLAG_NOFORK))
+USE_SH(NEWTOY(source, "<1", TOYFLAG_NOFORK))
+USE_SH(OLDTOY(., source, TOYFLAG_NOFORK))
 USE_SH(NEWTOY(unset, "fvn", TOYFLAG_NOFORK))
 
 USE_SH(NEWTOY(sh, "(noediting)(noprofile)(norc)sc:i", TOYFLAG_BIN))
@@ -159,6 +162,15 @@ config SHIFT
 
     Skip N (default 1) positional parameters, moving $1 and friends along the list.
     Does not affect $0.
+
+config SOURCE
+  bool
+  default n
+  depends on SH
+  help
+    usage: source FILE [ARGS...]
+
+    Read FILE and execute commands. Any ARGS become positional parameters.
 */
 
 #define FOR_sh
@@ -174,19 +186,20 @@ GLOBALS(
     } exec;
   };
 
-  // keep lineno here, we use it to work around a compiler limitation
+  // keep lineno here: used to work around compiler limitation in run_command()
   long lineno;
-  char *ifs, *isexec;
+  char *ifs, *isexec, *wcpat;
   unsigned options, jobcnt;
   int hfd, pid, bangpid, varslen, shift, cdcount;
   long long SECONDS;
 
+  // global and local variables
   struct sh_vars {
     long flags;
     char *str;
   } *vars;
 
-  // Parsed function
+  // Parsed functions
   struct sh_function {
     char *name;
     struct sh_pipeline {  // pipeline segments
@@ -210,52 +223,13 @@ GLOBALS(
     struct sh_arg *raw, arg;
   } *pp; // currently running process
 
-  struct sh_arg jobs, *arg;  // job list, command line args for $* etc
+  // job list, command line for $*, scratch space for do_wildcard_files()
+  struct sh_arg jobs, *arg, *wcdeck;
 )
 
 // Can't yet avoid this prototype. Fundamental problem is $($($(blah))) nests,
 // leading to function loop with run->parse->run
 static int sh_run(char *new);
-
-#define BUGBUG 0
-
-// call with NULL to just dump FDs
-static void dump_state(struct sh_function *sp)
-{
-  struct sh_pipeline *pl;
-  long i;
-  int q = 0, fd = open("/proc/self/fd", O_RDONLY);
-  DIR *dir = fdopendir(fd);
-  char buf[256];
-
-  if (sp && sp->expect) {
-    struct double_list *dl;
-
-    for (dl = sp->expect; dl; dl = (dl->next == sp->expect) ? 0 : dl->next)
-      dprintf(255, "expecting %s\n", dl->data);
-    if (sp->pipeline)
-      dprintf(255, "pipeline count=%d here=%d\n", sp->pipeline->prev->count,
-        sp->pipeline->prev->here);
-  }
-
-  if (sp) for (pl = sp->pipeline; pl ; pl = (pl->next == sp->pipeline) ? 0 : pl->next) {
-    for (i = 0; i<pl->arg->c; i++)
-      dprintf(255, "arg[%d][%ld]=%s\n", q, i, pl->arg->v[i]);
-    if (pl->arg->c<0) dprintf(255, "argc=%d\n", pl->arg->c);
-    else dprintf(255, "type=%d term[%d]=%s\n", pl->type, q++, pl->arg->v[pl->arg->c]);
-  }
-
-  if (dir) {
-    struct dirent *dd;
-
-    while ((dd = readdir(dir))) {
-      if (atoi(dd->d_name)!=fd && 0<readlinkat(fd, dd->d_name, buf,sizeof(buf)))
-        dprintf(255, "OPEN %d: %s = %s\n", getpid(), dd->d_name, buf);
-    }
-    closedir(dir);
-  }
-  close(fd);
-}
 
 // ordered for greedy matching, so >&; becomes >& ; not > &;
 // making these const means I need to typecast the const away later to
@@ -273,6 +247,7 @@ static void syntax_err(char *s)
 {
   error_msg("syntax error: %s", s);
   toys.exitval = 2;
+  if (!(TT.options&OPT_I)) xexit();
 }
 
 // append to array with null terminator and realloc as necessary
@@ -286,21 +261,23 @@ static void arg_add(struct sh_arg *arg, char *data)
 }
 
 // add argument to an arg_list
-static void push_arg(struct arg_list **list, char *arg)
+static char *push_arg(struct arg_list **list, char *arg)
 {
   struct arg_list *al;
 
-  if (!list) return;
-  al = xmalloc(sizeof(struct arg_list));
-  al->next = *list;
-  al->arg = arg;
-  *list = al;
+  if (list) {
+    al = xmalloc(sizeof(struct arg_list));
+    al->next = *list;
+    al->arg = arg;
+    *list = al;
+  }
+
+  return arg;
 }
 
 static void arg_add_del(struct sh_arg *arg, char *data,struct arg_list **delete)
 {
-  push_arg(delete, data);
-  arg_add(arg, data);
+  arg_add(arg, push_arg(delete, data));
 }
 
 // return length of valid variable name
@@ -457,11 +434,11 @@ static char *declarep(struct sh_vars *var)
 
   for (in = types = varend(var->str); *in; in++) len += !!strchr("$\"\\`", *in);
   len += in-types;
-  ss = xmalloc(len+13);
+  ss = xmalloc(len+15);
 
   out = ss + sprintf(ss, "declare -%s \"", out);
-  while (types) {
-    if (strchr("$\"\\`", *in)) *out++ = '\\';
+  while (*types) {
+    if (strchr("$\"\\`", *types)) *out++ = '\\';
     *out++ = *types++;
   }
   *out++ = '"';
@@ -574,7 +551,7 @@ static char *parse_word(char *start, int early, int quote)
 
     // backslash escapes
     else if (*end == '\\') {
-      if (!end[1] || (end[1]=='\n' && !end[2])) return 0;
+      if (!end[1] || (end[1]=='\n' && !end[2])) return early ? end+1 : 0;
       end += 2;
     } else if (*end == '$' && -1 != (i = stridx("({[", end[1]))) {
       end++;
@@ -592,7 +569,7 @@ static char *parse_word(char *start, int early, int quote)
     end++;
   }
 
-  return quote ? 0 : end;
+  return (quote && !early) ? 0 : end;
 }
 
 // Return next available high (>=10) file descriptor
@@ -602,7 +579,7 @@ static int next_hfd()
 
   for (; TT.hfd<=99999; TT.hfd++) if (-1 == fcntl(TT.hfd, F_GETFL)) break;
   hfd = TT.hfd;
-  if (TT.hfd > 99999) {
+  if (TT.hfd>99999) {
     hfd = -1;
     if (!errno) errno = EMFILE;
   }
@@ -625,7 +602,7 @@ static int save_redirect(int **rd, int from, int to)
     if ((hfd = next_hfd())==-1) return 1;
     if (hfd != dup2(to, hfd)) hfd = -1;
     else fcntl(hfd, F_SETFD, FD_CLOEXEC);
-if (BUGBUG) dprintf(255, "%d redir from=%d to=%d hfd=%d\n", getpid(), from, to, hfd);
+
     // dup "to"
     if (from >= 0 && to != dup2(from, to)) {
       if (hfd >= 0) close(hfd);
@@ -633,7 +610,6 @@ if (BUGBUG) dprintf(255, "%d redir from=%d to=%d hfd=%d\n", getpid(), from, to, 
       return 1;
     }
   } else {
-if (BUGBUG) dprintf(255, "%d schedule close %d\n", getpid(), to);
     hfd = to;
     to = -1;
   }
@@ -666,7 +642,6 @@ static int run_subshell(char *str, int len)
 {
   pid_t pid;
 
-if (BUGBUG) dprintf(255, "run_subshell %.*s\n", len, str);
   // The with-mmu path is significantly faster.
   if (CFG_TOYBOX_FORK) {
     char *s;
@@ -722,13 +697,10 @@ static void unredirect(int *urd)
 
   if (!urd) return;
 
-  for (i = 0; i<*urd; i++, rr += 2) {
-if (BUGBUG) dprintf(255, "%d urd %d %d\n", getpid(), rr[0], rr[1]);
-    if (rr[0] != -1) {
-      // No idea what to do about fd exhaustion here, so Steinbach's Guideline.
-      dup2(rr[0], rr[1]);
-      close(rr[0]);
-    }
+  for (i = 0; i<*urd; i++, rr += 2) if (rr[0] != -1) {
+    // No idea what to do about fd exhaustion here, so Steinbach's Guideline.
+    dup2(rr[0], rr[1]);
+    close(rr[0]);
   }
   free(urd);
 }
@@ -810,44 +782,216 @@ char *getvar_special(char *str, int len, int *used, struct arg_list **delete)
   return s;
 }
 
-// Copy string until } including escaped }
-char *slashcopy(char *s, char c)
+// Return length of utf8 char @s fitting in len, writing value into *cc
+int getutf8(char *s, int len, int *cc)
 {
-  char *ss;
-  int ii, jj;
+  wchar_t wc;
 
-  for (ii = 0; s[ii] != c; ii++) if (s[ii] == '\\') ii++;
-  ss = xmalloc(ii+1);
-  for (ii = jj = 0; s[jj] != c; ii++)
-    if ('\\'==(ss[ii] = s[jj++])) ss[ii] = s[jj++];
-  ss[ii] = 0;
+  if (len<0) wc = len = 0;
+  else if (1>(len = utf8towc(&wc, s, len))) wc = *s, len = 1;
+  if (cc) *cc = wc;
 
-  return ss;
+  return len;
 }
 
-// Return 0 fail, 1 short match, 2 exact match
-static int wildcard_match(char *str, char *pattern, struct sh_arg *deck)
+#define WILD_SHORT 1 // else longest match
+#define WILD_CASE  2 // case insensitive
+#define WILD_ANY   4 // advance through pattern instead of str
+// Returns length of str matched by pattern, or -1 if not all pattern consumed
+static int wildcard_matchlen(char *str, int len, char *pattern, int plen,
+  struct sh_arg *deck, int flags)
 {
-  int i;
+  struct sh_arg ant = {0};    // stack: of str offsets
+  long ss, pp, dd, best = -1;
+  int i, j, c, not;
 
-// TODO actual plumbing here
-  for (i = 0; str[i]; i++) if (str[i]!=pattern[i]) return 0;
+  // Loop through wildcards in pattern.
+  for (ss = pp = dd = 0; ;) {
+    if ((flags&WILD_ANY) && best!=-1) break;
 
-  return 1+!pattern[i];
+    // did we consume pattern?
+    if (pp==plen) {
+      if (ss>best) best = ss;
+      if (ss==len || (flags&WILD_SHORT)) break;
+    // attempt literal match?
+    } else if (dd>=deck->c || pp!=(long)deck->v[dd]) {
+      if (ss<len) {
+        if (flags&WILD_CASE) {
+          c = towupper(getutf8(str+ss, len-ss, &i));
+          ss += i;
+          i = towupper(getutf8(pattern+pp, pp-plen, &j));
+          pp += j;
+        } else c = str[ss++], i = pattern[pp++];
+        if (c==i) continue;
+      }
+
+    // Wildcard chars: |+@!*?()[]
+    } else {
+      c = pattern[pp++];
+      dd++;
+      if (c=='?' || ((flags&WILD_ANY) && c=='*')) {
+        ss += (i = getutf8(str+ss, len-ss, 0));
+        if (i) continue;
+      } else if (c=='*') {
+
+        // start with zero length match, don't record consecutive **
+        if (dd==1 || pp-2!=(long)deck->v[dd-1] || pattern[pp-2]!='*') {
+          arg_add(&ant, (void *)ss);
+          arg_add(&ant, 0);
+        }
+
+        continue;
+      } else if (c == '[') {
+        pp += (not = !!strchr("!^", pattern[pp]));
+        ss += getutf8(str+ss, len-ss, &c);
+        for (i = 0; pp<(long)deck->v[dd]; i = 0) {
+          pp += getutf8(pattern+pp, plen-pp, &i);
+          if (pattern[pp]=='-') {
+            ++pp;
+            pp += getutf8(pattern+pp, plen-pp, &j);
+            if (not^(i<=c && j>=c)) break;
+          } else if (not^(i==c)) break;
+        }
+        if (i) {
+          pp = 1+(long)deck->v[dd++];
+
+          continue;
+        }
+
+      // ( preceded by +@!*?
+
+      } else { // TODO ( ) |
+        dd++;
+        continue;
+      }
+    }
+
+    // match failure
+    if (flags&WILD_ANY) {
+      ss = 0;
+      if (plen==pp) break;
+      continue;
+    }
+
+    // pop retry stack or return failure (TODO: seek to next | in paren)
+    while (ant.c) {
+      if ((c = pattern[(long)deck->v[--dd]])=='*') {
+        if (len<(ss = (long)ant.v[ant.c-2]+(long)++ant.v[ant.c-1])) ant.c -= 2;
+        else {
+          pp = (long)deck->v[dd++]+1;
+          break;
+        }
+      } else if (c == '(') dprintf(2, "TODO: (");
+    }
+
+    if (!ant.c) break;
+  }
+  free (ant.v);
+
+  return best;
 }
 
-// wildcard expand data and add results to arg list
-static void wildcard_add(struct sh_arg *arg, char *pattern, struct sh_arg *deck,
-  struct arg_list **delete)
+static int wildcard_match(char *s, char *p, struct sh_arg *deck, int flags)
 {
-// TODO: abc/*/def.txt in segments, partial matches
-  arg_add(arg, pattern);
-// TODO when flush deck?
+  return wildcard_matchlen(s, strlen(s), p, strlen(p), deck, flags);
+}
+
+
+// TODO: test that * matches ""
+
+// skip to next slash in wildcard path, passing count active ranges.
+// start at pattern[off] and deck[*idx], return pattern pos and update *idx
+char *wildcard_path(char *pattern, int off, struct sh_arg *deck, int *idx,
+  int count)
+{
+  char *p, *old;
+  int i = 0, j = 0;
+
+  // Skip [] and nested () ranges within deck until / or NUL
+  for (p = old = pattern+off;; p++) {
+    if (!*p) return p;
+    while (*p=='/') {
+      old = p++;
+      if (j && !count) return old;
+      j = 0;
+    }
+
+    // Got wildcard? Return if start of name if out of count, else skip [] ()
+    if (*idx<deck->c && p-pattern == (long)deck->v[*idx]) {
+      if (!j++ && !count--) return old;
+      ++*idx;
+      if (*p=='[') p = pattern+(long)deck->v[(*idx)++];
+      else if (*p=='(') while (*++p) if (p-pattern == (long)deck->v[*idx]) {
+        ++*idx;
+        if (*p == ')') {
+          if (!i) break;
+          i--;
+        } else if (*p == '(') i++;
+      }
+    }
+  }
+}
+
+// TODO ** means this directory as well as ones below it, shopt -s globstar
+
+// Filesystem traversal callback
+// pass on: filename, portion of deck, portion of pattern,
+// input: pattern+offset, deck+offset. Need to update offsets.
+int do_wildcard_files(struct dirtree *node)
+{
+  struct dirtree *nn;
+  char *pattern, *patend;
+  int lvl, ll = 0, ii = 0, rc;
+  struct sh_arg ant;
+
+  // Top level entry has no pattern in it
+  if (!node->parent) return DIRTREE_RECURSE;
+
+  // Find active pattern range
+  for (nn = node->parent; nn; nn = nn->parent) if (nn->parent) ii++;
+  pattern = wildcard_path(TT.wcpat, 0, TT.wcdeck, &ll, ii);
+  while (*pattern=='/') pattern++;
+  lvl = ll;
+  patend = wildcard_path(TT.wcpat, pattern-TT.wcpat, TT.wcdeck, &ll, 1);
+
+  // Don't include . entries unless explicitly asked for them 
+  if (*node->name=='.' && *pattern!='.') return 0;
+
+  // Don't descend into non-directory (was called with DIRTREE_SYMFOLLOW)
+  if (*patend && !S_ISDIR(node->st.st_mode) && *node->name) return 0;
+
+  // match this filename from pattern to p in deck from lvl to ll
+  ant.c = ll-lvl;
+  ant.v = TT.wcdeck->v+lvl;
+  for (ii = 0; ii<ant.c; ii++) TT.wcdeck->v[lvl+ii] -= pattern-TT.wcpat;
+  rc = wildcard_matchlen(node->name, strlen(node->name), pattern,
+    patend-pattern, &ant, 0);
+  for (ii = 0; ii<ant.c; ii++) TT.wcdeck->v[lvl+ii] += pattern-TT.wcpat;
+
+  // Return failure or save exact match.
+  if (rc<0 || node->name[rc]) return 0;
+  if (!*patend) return DIRTREE_SAVE;
+
+  // Are there more wildcards to test children against?
+  if (TT.wcdeck->c!=ll) return DIRTREE_RECURSE;
+
+  // No more wildcards: check for child and return failure if it isn't there.
+  pattern = xmprintf("%s%s", node->name, patend);
+  rc = faccessat(dirtree_parentfd(node), pattern, F_OK, AT_SYMLINK_NOFOLLOW);
+  free(pattern);
+  if (rc) return 0;
+
+  // Save child and self. (Child could be trailing / but only one saved.)
+  while (*patend=='/' && patend[1]) patend++;
+  node->child = xzalloc(sizeof(struct dirtree)+1+strlen(patend));
+  node->child->parent = node;
+  strcpy(node->child->name, patend);
+
+  return DIRTREE_SAVE;
 }
 
 // Record active wildcard chars in output string
 // *new start of string, oo offset into string, deck is found wildcards,
-// ant is scratch space for nested +()
 static void collect_wildcards(char *new, long oo, struct sh_arg *deck)
 {
   long bracket, *vv;
@@ -858,6 +1002,27 @@ static void collect_wildcards(char *new, long oo, struct sh_arg *deck)
   if (!deck->c) arg_add(deck, 0);
   vv = (long *)deck->v;
 
+  // vv[0] used for paren level (bottom 16 bits) + bracket start offset<<16
+
+  // at end loop backwards through live wildcards to remove pending unmatched (
+  if (!cc) {
+    long ii = 0, jj = 65535&*vv, kk;
+
+    for (kk = deck->c; jj;) {
+      if (')' == (cc = new[vv[--kk]])) ii++;
+      else if ('(' == cc) {
+        if (ii) ii--;
+        else {
+          memmove(vv+kk, vv+kk+1, sizeof(long)*(deck->c-- -kk));
+          jj--;
+        }
+      }
+    }
+    if (deck->c) memmove(vv, vv+1, sizeof(long)*deck->c--);
+
+    return;
+  }
+
   // Start +( range, or remove first char that isn't wildcard without (
   if (deck->c>1 && vv[deck->c-1] == oo-1 && strchr("+@!*?", new[oo-1])) {
     if (cc == '(') {
@@ -866,42 +1031,85 @@ static void collect_wildcards(char *new, long oo, struct sh_arg *deck)
     } else if (!strchr("*?", new[oo-1])) deck->c--;
   }
 
-  // yank unifinished ( ranges from metadata, they're not live wildcards
-  if (!cc) {
-    long ii = 0, jj = 65535&*vv;
-
-    for (oo = deck->c; jj;) {
-      cc = new[vv[--oo]];
-      if (')' == cc) ii++;
-      else if ('(' == cc) {
-        if (ii) ii--;
-        else {
-          memmove(vv+oo, vv+oo+1, sizeof(long)*(deck->c-- -oo));
-          jj--;
-        }
-      }
-    }
-
-    return;
-  } else if (strchr("|+@!*?", cc));
-  // Pop parentheses stack
+  // fall through to add wildcard, popping parentheses stack as necessary
+  if (strchr("|+@!*?", cc));
   else if (cc == ')' && (65535&*vv)) --*vv;
 
-  // If we complete a [range] discard any other wildcards within, add [ and ]
+  // complete [range], discard wildcards within, add [, fall through to add ]
   else if (cc == ']' && (bracket = *vv>>16)) {
-    if (bracket == oo || (bracket+1 == oo && new[oo-1] == '^')) return;
+
+    // don't end range yet for [] or [^]
+    if (bracket+1 == oo || (bracket+2 == oo && strchr("!^", new[oo-1]))) return;
     while (deck->c>1 && vv[deck->c-1]>=bracket) deck->c--;
     *vv &= 65535;
-    arg_add(deck, (void *)--bracket);
+    arg_add(deck, (void *)bracket);
 
-  // [ is speculative, don't add to deck yet, just record we saw it
+  // Not a wildcard
   } else {
+    // [ is speculative, don't add to deck yet, just record we saw it
     if (cc == '[' && !(*vv>>16)) *vv = (oo<<16)+(65535&*vv);
     return;
   }
 
   // add active wildcard location
   arg_add(deck, (void *)oo);
+}
+
+// wildcard expand data against filesystem, and add results to arg list
+// Note: this wildcard deck has extra argument at start (leftover from parsing)
+static void wildcard_add_files(struct sh_arg *arg, char *pattern,
+  struct sh_arg *deck, struct arg_list **delete)
+{
+  struct dirtree *dt;
+  char *pp;
+  int ll = 0;
+
+  // fast path: when no wildcards, add pattern verbatim
+  collect_wildcards("", 0, deck);
+  if (!deck->c) return arg_add(arg, pattern);
+
+  // Traverse starting with leading patternless path.
+  pp = wildcard_path(TT.wcpat = pattern, 0, TT.wcdeck = deck, &ll, 0);
+  pp = (pp==pattern) ? 0 : xstrndup(pattern, pp-pattern);
+  dt = dirtree_flagread(pp, DIRTREE_STATLESS|DIRTREE_SYMFOLLOW,
+    do_wildcard_files);
+  free(pp);
+  deck->c = 0;
+
+  // If no match save pattern, else free tree saving each path found.
+  if (!dt) return arg_add(arg, pattern);
+  while (dt) {
+    while (dt->child) dt = dt->child;
+    arg_add(arg, dirtree_path(dt, 0));
+    do {
+      pp = (void *)dt;
+      if ((dt = dt->parent)) dt->child = dt->child->next;
+      free(pp);
+    } while (dt && !dt->child);
+  }
+// TODO: test .*/../
+}
+
+// Copy string until } including escaped }
+// if deck collect wildcards, and store terminator at deck->v[deck->c]
+char *slashcopy(char *s, char *c, struct sh_arg *deck)
+{
+  char *ss;
+  long ii, jj;
+
+  for (ii = 0; !strchr(c, s[ii]); ii++) if (s[ii] == '\\') ii++;
+  ss = xmalloc(ii+1);
+  for (ii = jj = 0; !strchr(c, s[jj]); ii++)
+    if ('\\'==(ss[ii] = s[jj++])) ss[ii] = s[jj++];
+    else if (deck) collect_wildcards(ss, ii, deck);
+  ss[ii] = 0;
+  if (deck) {
+    arg_add(deck, 0);
+    deck->v[--deck->c] = (void *)jj;
+    collect_wildcards("", 0, deck);
+  }
+
+  return ss;
 }
 
 #define NO_QUOTE (1<<0)    // quote removal
@@ -917,12 +1125,9 @@ static void collect_wildcards(char *new, long oo, struct sh_arg *deck)
 static int expand_arg_nobrace(struct sh_arg *arg, char *str, unsigned flags,
   struct arg_list **delete, struct sh_arg *ant)
 {
-  char cc, qq = flags&NO_QUOTE, sep[6], *new = str, *s, *ss, *ifs,
-    *slice;
+  char cc, qq = flags&NO_QUOTE, sep[6], *new = str, *s, *ss, *ifs, *slice;
   int ii = 0, oo = 0, xx, yy, dd, jj, kk, ll, mm;
   struct sh_arg deck = {0};
-
-if (BUGBUG) dprintf(255, "expand %s\n", str);
 
   // Tilde expansion
   if (!(flags&NO_TILDE) && *str == '~') {
@@ -955,11 +1160,10 @@ if (BUGBUG) dprintf(255, "expand %s\n", str);
     struct sh_arg aa = {0};
     int nosplit = 0;
 
-    if (!(flags&NO_PATH) && !(qq&1)) collect_wildcards(new, oo, ant);
-
     // skip literal chars
     if (!strchr("'\"\\$`"+2*(flags&NO_QUOTE), cc)) {
       if (str != new) new[oo] = cc;
+      if (!(flags&NO_PATH) && !(qq&1)) collect_wildcards(new, oo, ant);
       oo++;
       continue;
     }
@@ -973,7 +1177,7 @@ if (BUGBUG) dprintf(255, "expand %s\n", str);
 
     // handle escapes and quoting
     if (cc == '\\') {
-      if (!(qq&1) || strchr("\"\\$`", str[ii]))
+      if (!(qq&1) || (str[ii] && strchr("\"\\$`", str[ii])))
         new[oo++] = str[ii] ? str[ii++] : cc;
     } else if (cc == '"') qq++;
     else if (cc == '\'') {
@@ -1060,18 +1264,15 @@ dprintf(2, "TODO: do math for %.*s\n", kk, s);
         else if (cc == '#') {  // TODO ${#x[@]}
           dd = !!strchr("@*", *ss);  // For ${#@} or ${#*} do normal ${#}
           ifs = getvar_special(ss-dd, jj, &kk, delete) ? : "";
-          if (!dd) push_arg(delete, ifs = xmprintf("%ld", strlen(ifs)));
+          if (!dd) push_arg(delete, ifs = xmprintf("%zu", strlen(ifs)));
         // ${!@} ${!@Q} ${!x} ${!x@} ${!x@Q} ${!x#} ${!x[} ${!x[*]}
         } else if (cc == '!') {  // TODO: ${var[@]} array
 
           // special case: normal varname followed by @} or *} = prefix list
           if (ss[jj] == '*' || (ss[jj] == '@' && !isalpha(ss[jj+1]))) {
-            for (slice++, kk = 0; kk<TT.varslen; kk++) {
-              if (!strncmp(s = TT.vars[kk].str, ss, jj)) {
-                arg_add(&aa, s = xstrndup(s, stridx(s, '=')));
-                push_arg(delete, s);
-              }
-            }
+            for (slice++, kk = 0; kk<TT.varslen; kk++)
+              if (!strncmp(s = TT.vars[kk].str, ss, jj))
+                arg_add(&aa, push_arg(delete, s = xstrndup(s, stridx(s, '='))));
             if (aa.c) push_arg(delete, (void *)aa.v);
 
           // else dereference to get new varname, discarding if none, check err
@@ -1129,6 +1330,9 @@ barf:
     }
 
     // combine before/ifs/after sections & split words on $IFS in ifs
+    // keep oo bytes of str before (already parsed)
+    // insert ifs (active for wildcards+splitting)
+    // keep str+ii after (still to parse)
 
     // Fetch separator to glue string back together with
     *sep = 0;
@@ -1154,13 +1358,15 @@ barf:
         dd = slice[xx = (*slice == ':')];
         if (!ifs || (xx && !*ifs)) {
           if (strchr("-?=", dd)) { // - use default = assign default ? error
-            push_arg(delete, ifs = slashcopy(slice+xx+1, '}'));
+            push_arg(delete, ifs = slashcopy(slice+xx+1, "}", 0));
             if (dd == '?' || (dd == '=' &&
               !(setvar(s = xmprintf("%.*s=%s", (int)(slice-ss), ss, ifs)))))
                 goto barf;
           }
+        } else if (dd == '-'); // NOP when ifs not empty
         // use alternate value
-        } else if (dd == '+') push_arg(delete, ifs = slashcopy(slice+xx+1,'}'));
+        else if (dd == '+')
+          push_arg(delete, ifs = slashcopy(slice+xx+1, "}", 0));
         else if (xx) { // ${x::}
           long long la, lb, lc;
 
@@ -1196,26 +1402,110 @@ barf:
             for (dd = 0; dd<lb ; dd++) if (!(ifs[dd] = ifs[dd+la])) break;
             ifs[dd] = 0;
           }
+        } else if (strchr("#%^,", *slice)) {
+          struct sh_arg wild = {0};
+          char buf[8];
+
+          s = slashcopy(slice+(xx = slice[1]==*slice)+1, "}", &wild);
+
+          // ${x^pat} ${x^^pat} uppercase ${x,} ${x,,} lowercase (no pat = ?)
+          if (strchr("^,", *slice)) {
+            for (ss = ifs; *ss; ss += dd) {
+              dd = getutf8(ss, 4, &jj);
+              if (!*s || 0<wildcard_match(ss, s, &wild, WILD_ANY)) {
+                ll = ((*slice=='^') ? towupper : towlower)(jj);
+
+                // Of COURSE unicode case switch can change utf8 encoding length
+                // Lower case U+0069 becomes u+0130 in turkish.
+                // Greek U+0390 becomes 3 characters TODO test this
+                if (ll != jj) {
+                  yy = ss-ifs;
+                  if (!*delete || (*delete)->arg!=ifs)
+                    push_arg(delete, ifs = xstrdup(ifs));
+                  if (dd != (ll = wctoutf8(buf, ll))) {
+                    if (dd<ll)
+                      ifs = (*delete)->arg = xrealloc(ifs, strlen(ifs)+1+dd-ll);
+                    memmove(ifs+yy+dd-ll, ifs+yy+ll, strlen(ifs+yy+ll)+1);
+                  }
+                  memcpy(ss = ifs+yy, buf, dd = ll);
+                }
+              }
+              if (!xx) break;
+            }
+          // ${x#y} remove shortest prefix ${x##y} remove longest prefix
+          } else if (*slice=='#') {
+            if (0<(dd = wildcard_match(ifs, s, &wild, WILD_SHORT*!xx)))
+              ifs += dd;
+          // ${x%y} ${x%%y} suffix
+          } else if (*slice=='%') {
+            for (ss = ifs+strlen(ifs), yy = -1; ss>=ifs; ss--) {
+              if (0<(dd = wildcard_match(ss, s, &wild, WILD_SHORT*xx))&&!ss[dd])
+              {
+                yy = ss-ifs;
+                if (!xx) break;
+              }
+            }
+
+            if (yy != -1) {
+              if (*delete && (*delete)->arg==ifs) ifs[yy] = 0;
+              else push_arg(delete, ifs = xstrndup(ifs, yy));
+            }
+          }
+          free(s);
+          free(wild.v);
+
+        // ${x/pat/sub} substitute ${x//pat/sub} global ${x/#pat/sub} begin
+        // ${x/%pat/sub} end ${x/pat} delete pat (x can be @ or *)
+        } else if (*slice=='/') {
+          struct sh_arg wild = {0};
+
+          s = slashcopy(ss = slice+(xx = !!strchr("/#%", slice[1]))+1, "/}",
+            &wild);
+          ss += (long)wild.v[wild.c];
+          ss = (*ss == '/') ? slashcopy(ss+1, "}", 0) : 0;
+          jj = ss ? strlen(ss) : 0;
+          ll = 0;
+          for (ll = 0; ifs[ll];) {
+            // TODO nocasematch option
+            if (0<(dd = wildcard_match(ifs+ll, s, &wild, 0))) {
+              char *bird = 0;
+
+              if (slice[1]=='%' && ifs[ll+dd]) {
+                ll++;
+                continue;
+              }
+              if (*delete && (*delete)->arg==ifs) {
+                if (jj==dd) memcpy(ifs+ll, ss, jj);
+                else if (jj<dd) sprintf(ifs+ll, "%s%s", ss, ifs+ll+dd);
+                else bird = ifs;
+              } else bird = (void *)1;
+              if (bird) {
+                ifs = xmprintf("%.*s%s%s", ll, ifs, ss ? : "", ifs+ll+dd);
+                if (bird != (void *)1) {
+                  free(bird);
+                  (*delete)->arg = ifs;
+                } else push_arg(delete, ifs);
+              }
+              if (slice[1]!='/') break;
+            } else ll++;
+            if (slice[1]=='#') break;
+          }
+
+// ${x@QEPAa} Q=$'blah' E=blah without the $'' wrap, P=expand as $PS1
+//   A=declare that recreates var a=attribute flags
+//   x can be @*
+//      } else if (*slice=='@') {
+
+// TODO test x can be @ or *
         } else {
 // TODO test ${-abc} as error
           ifs = slice;
           goto barf;
         }
 
-// ${x#y} remove shortest prefix ${x##y} remove longest prefix
-//   x can be @ or *
-// ${x%y} ${x%%y} suffix
-// ${x/pat/sub} substitute ${x//pat/sub} global ${x/#pat/sub} begin
-// ${x/%pat/sub} end ${x/pat} delete pat
-//   x can be @ or *
-// ${x^pat} ${x^^pat} uppercase/g ${x,} ${x,,} lowercase/g (no pat = ?)
-// ${x@QEPAa} Q=$'blah' E=blah without the $'' wrap, P=expand as $PS1
-//   A=declare that recreates var a=attribute flags
-//   x can be @*
-
 // TODO: $((a=42)) can change var, affect lifetime
 // must replace ifs AND any previous output arg[] within pointer strlen()
-
+// also x=;echo $x${x:=4}$x
       }
 
       // Nothing left to do?
@@ -1234,7 +1524,7 @@ barf:
           if (qq || ss!=ifs) {
             if (!(flags&NO_PATH))
               for (jj = 0; ifs[jj]; jj++) collect_wildcards(ifs, jj, ant);
-            wildcard_add(arg, ifs, &deck, delete);
+            wildcard_add_files(arg, ifs, &deck, delete);
           }
           continue;
         }
@@ -1253,7 +1543,7 @@ barf:
         if (!nosplit) {
           if (qq || *new || *ss) {
             push_arg(delete, new = xrealloc(new, strlen(new)+1));
-            wildcard_add(arg, new, &deck, delete);
+            wildcard_add_files(arg, new, &deck, delete);
             new = xstrdup(str+ii);
           }
           qq &= 1;
@@ -1279,7 +1569,7 @@ barf:
   // Record result.
   if (*new || qq) {
     if (str != new) push_arg(delete, new);
-    wildcard_add(arg, new, &deck, delete);
+    wildcard_add_files(arg, new, &deck, delete);
     new = 0;
   }
 
@@ -1289,6 +1579,7 @@ barf:
 fail:
   if (str != new) free(new);
   free(deck.v);
+  if (ant!=&deck && ant->v) collect_wildcards("", 0, ant);
 
   return !!arg;
 }
@@ -1417,10 +1708,10 @@ static int expand_arg(struct sh_arg *arg, char *old, unsigned flags,
       if (!bnext || bb->cnt<0 || bnext->commas[0]>bb->commas[bb->idx+1]) {
 
         // output uninterrupted span
-        if (bb->cnt<0)
-          s += sprintf(s, (bb->cnt==-1) ? "%c" : "%d",
-                       bb->commas[2]+bb->commas[4]*bb->idx);
-        else {
+        if (bb->cnt<0) {
+          k = bb->commas[2]+bb->commas[4]*bb->idx;
+          s += sprintf(s, (bb->cnt==-1) ? "\\%c"+!ispunct(k) : "%d", k);
+        } else {
           i = bb->commas[bstk->idx]+1;
           s = stpncpy(s, old+i, bb->commas[bb->idx+1]-i);
         }
@@ -1449,8 +1740,7 @@ static int expand_arg(struct sh_arg *arg, char *old, unsigned flags,
     }
 
     // Save result, aborting on expand error
-    push_arg(delete, ss);
-    if (expand_arg_nobrace(arg, ss, flags, delete, 0)) {
+    if (expand_arg_nobrace(arg, push_arg(delete, ss), flags, delete, 0)) {
       llist_traverse(blist, free);
 
       return 1;
@@ -1738,6 +2028,7 @@ static void shexec(char *cmd, char **argv)
 {
   xsetenv(xmprintf("_=%s", cmd), 0);
   execve(cmd, argv, environ);
+// TODO: why?
   if (errno == ENOEXEC) run_subshell("source \"$_\"", 11);
 }
 
@@ -1766,15 +2057,12 @@ static struct sh_process *run_command(struct sh_arg *arg)
   struct arg_list *delete = 0;
   struct toy_list *tl;
 
-if (BUGBUG) dprintf(255, "run_command %s\n", arg->v[0]);
-
   // Count leading variable assignments
   for (envlen = 0; envlen<arg->c; envlen++) {
     s = varend(arg->v[envlen]);
     if (s == arg->v[envlen] || *s != '=') break;
   }
 
-if (BUGBUG) { int i; dprintf(255, "envlen=%d arg->c=%d run=", envlen, arg->c); for (i=0; i<arg->c; i++) dprintf(255, "'%s' ", arg->v[i]); dprintf(255, "\n"); }
   // perform assignments locally if there's no command
   if (envlen == arg->c) {
     while (jj<envlen) {
@@ -1811,7 +2099,6 @@ if (BUGBUG) { int i; dprintf(255, "envlen=%d arg->c=%d run=", envlen, arg->c); f
 
   // expand arguments and perform redirects
   pp = expand_redir(arg, envlen, 0);
-if (BUGBUG) { int i; dprintf(255, "cooked arg->c=%d run=", arg->c); for (i=0; i<pp->arg.c; i++) dprintf(255, "'%s' ", pp->arg.v[i]); dprintf(255, "\n"); }
 
   // Do nothing if nothing to do
   if (pp->exit || !pp->arg.v);
@@ -1917,7 +2204,7 @@ static struct sh_pipeline *add_pl(struct sh_function *sp, struct sh_arg **arg)
 // 1 to request another line of input (> prompt), -1 for syntax err
 static int parse_line(char *line, struct sh_function *sp)
 {
-  char *start = line, *delete = 0, *end, *last = 0, *s, *ex, done = 0,
+  char *start = line, *delete = 0, *end, *s, *ex, done = 0,
     *tails[] = {"fi", "done", "esac", "}", "]]", ")", 0};
   struct sh_pipeline *pl = sp->pipeline ? sp->pipeline->prev : 0, *pl2, *pl3;
   struct sh_arg *arg = 0;
@@ -1953,8 +2240,8 @@ static int parse_line(char *line, struct sh_function *sp)
       }
       start = 0;
 
-    // Nope, new segment
-    } else pl = 0;
+    // Nope, new segment if not self-managing type
+    } else if (pl->type < 128) pl = 0;
   }
 
   // Parse words, assemble argv[] pipelines, check flow control and HERE docs
@@ -1965,8 +2252,6 @@ static int parse_line(char *line, struct sh_function *sp)
     if (pl && pl->count == -1) {
       pl->count = 0;
       arg = pl->arg;
-
-if (BUGBUG>1) dprintf(255, "{%d:%s}\n", pl->type, ex ? ex : (sp->expect ? "*" : ""));
 
       // find arguments of the form [{n}]<<[-] with another one after it
       for (i = 0; i<arg->c; i++) {
@@ -2001,7 +2286,6 @@ if (BUGBUG>1) dprintf(255, "{%d:%s}\n", pl->type, ex ? ex : (sp->expect ? "*" : 
     // Parse next word and detect overflow (too many nested quotes).
     if ((end = parse_word(start, 0, 0)) == (void *)1) goto flush;
 
-if (BUGBUG>1) dprintf(255, "[%.*s:%s] ", end ? (int)(end-start) : 0, start, ex ? : "");
     // Is this a new pipeline segment?
     if (!pl) pl = add_pl(sp, &arg);
 
@@ -2017,56 +2301,34 @@ if (BUGBUG>1) dprintf(255, "[%.*s:%s] ", end ? (int)(end-start) : 0, start, ex ?
 
     // Ok, we have a word. What does it _mean_?
 
-    // case/esac parsing is weird, handle first
-    if (ex && !memcmp(ex, "esac\0A", 6)
-        && (pl->type || (*start==';' && end-start>1)))
-    {
-      // premature end of line only allowed at 'case x\nin' or after ;;
-      if (start == end) {
-        if (pl->type==1 && arg->c==2) break;
-        if (pl->type==2 && arg->c==1 && **arg->v==';') break;
+    // case/esac parsing is weird (unbalanced parentheses!), handle first
+    i = ex && !strcmp(ex, "esac") && (pl->type || (*start==';' && end-start>1));
+    if (i) {
+      // Premature EOL in type 1 (case x\nin) or 2 (at start or after ;;) is ok
+      if (end == start) {
+        if (pl->type==128 && arg->c==2) break;  // case x\nin
+        if (pl->type==129 && (!arg->c || (arg->c==1 && **arg->v==';'))) break;
         s = "newline";
         goto flush;
       }
 
-      // type 0: just got ;; so start new type 2 (catching "echo | ;;" errors)
+      // type 0 means just got ;; so start new type 2
       if (!pl->type) {
-        if (pl->prev->type==1) goto flush;
-        for (;;) {
-          if (arg->v[arg->c] && strcmp(arg->v[arg->c], "&")) goto flush;
-          if (arg->c) break;
-          arg = pl->prev->arg;
-        }
-        if (*arg->v) pl = add_pl(sp, &arg);
-        pl->type = 2;
-      }
-
-      // Save argument
-      arg_add(arg, s = xstrndup(start, end-start));
-      start = end;
-
-      // type 1: case x [\n] in
-      if (pl->type==1 && arg->c==3) {
-        if (strcmp(arg->v[2], "in")) goto flush;
-        (pl = add_pl(sp, &arg))->type = 2;
-
-      // type 2: [;;] [(] pattern [|pattern...] )
-      } else if (pl->type==2) {
-        *toybuf = ')';
-        i = arg->c - (**arg->v==';' && arg->v[0][1]);
-        if (arg->c==1 && **arg->v==';' && (long)parse_word(start,0,*s!='(')<2) {
-          pl = add_pl(sp, &arg);
-          sp->expect->prev->data = "esac\0B";
+        // catch "echo | ;;" errors
+        if (arg->v && arg->v[arg->c] && strcmp(arg->v[arg->c], "&")) goto flush;
+        if (!arg->c) {
+          if (pl->prev->type == 2) {
+            // Add a call to "true" between empty ) ;;
+            arg_add(arg, xstrdup(":"));
+            pl = add_pl(sp, &arg);
+          }
+          pl->type = 129;
         } else {
-          i -= arg->c>1 && *arg->v[1]=='(';
-          if (i>0 && ((i&1)==!!strchr("|)", *s) || strchr(";(", *s)))
-            goto flush;
-          if (*s=='&' || !strcmp(s, "||")) goto flush;
-          if (*s==')') pl = add_pl(sp, &arg);
+          // check for here documents
+          pl->count = -1;
+          continue;
         }
       }
-
-      continue;
 
     // Did we hit end of line or ) outside a function declaration?
     // ) is only saved at start of a statement, ends current statement
@@ -2088,7 +2350,6 @@ if (BUGBUG>1) dprintf(255, "[%.*s:%s] ", end ? (int)(end-start) : 0, start, ex ?
       // stop at EOL, else continue with new pipeline segment for )
       if (end == start) done++;
       pl->count = -1;
-      last = 0;
 
       continue;
     }
@@ -2096,6 +2357,46 @@ if (BUGBUG>1) dprintf(255, "[%.*s:%s] ", end ? (int)(end-start) : 0, start, ex ?
     // Save word and check for flow control
     arg_add(arg, s = xstrndup(start, end-start));
     start = end;
+
+    // Second half of case/esac parsing
+    if (i) {
+      // type 1 (128): case x [\n] in
+      if (pl->type==128) {
+        if (arg->c==2 && strchr("()|;&", *s)) goto flush;
+        if (arg->c==3) {
+          if (strcmp(s, "in")) goto flush;
+          pl->type = 1;
+          (pl = add_pl(sp, &arg))->type = 129;
+        }
+
+        continue;
+
+      // type 2 (129): [;;] [(] pattern [|pattern...] )
+      } else {
+
+        // can't start with line break or ";;" or "case ? in ;;" without ")"
+        if (*s==';') {
+          if (arg->c>1 || (arg->c==1 && pl->prev->type==1)) goto flush;
+        } else pl->type = 2;
+        i = arg->c - (**arg->v==';' && arg->v[0][1]);
+        if (i==1 && !strcmp(s, "esac")) {
+          // esac right after "in" or ";;" ends block, fall through
+          if (arg->c>1) {
+            arg->v[1] = 0;
+            pl = add_pl(sp, &arg);
+            arg_add(arg, s);
+          } else pl->type = 0;
+        } else {
+          if (arg->c>1) i -= *arg->v[1]=='(';
+          if (i>0 && ((i&1)==!!strchr("|)", *s) || strchr(";(", *s)))
+            goto flush;
+          if (*s=='&' || !strcmp(s, "||")) goto flush;
+          if (*s==')') pl = add_pl(sp, &arg);
+
+          continue;
+        }
+      }
+    }
 
     // is it a line break token?
     if (strchr(";|&", *s) && strncmp(s, "&>", 2)) {
@@ -2111,7 +2412,6 @@ if (BUGBUG>1) dprintf(255, "[%.*s:%s] ", end ? (int)(end-start) : 0, start, ex ?
 
       // ;; and friends only allowed in case statements
       } else if (*s == ';') goto flush;
-      last = s;
 
       // flow control without a statement is an error
       if (!arg->c) goto flush;
@@ -2129,7 +2429,6 @@ if (BUGBUG>1) dprintf(255, "[%.*s:%s] ", end ? (int)(end-start) : 0, start, ex ?
 
         // end function segment, expect function body
         pl->count = -1;
-        last = 0;
         dlist_add(&sp->expect, "}");
         dlist_add(&sp->expect, 0);
         dlist_add(&sp->expect, "{");
@@ -2141,7 +2440,7 @@ if (BUGBUG>1) dprintf(255, "[%.*s:%s] ", end ? (int)(end-start) : 0, start, ex ?
     } else if (ex && !memcmp(ex, "do\0A", 4)) {
 
       // Sanity check and break the segment
-      if (strncmp(s, "((", 2) && strchr(s, '=')) goto flush;
+      if (strncmp(s, "((", 2) && *varend(s)) goto flush;
       pl->count = -1;
       sp->expect->prev->data = "do\0C";
 
@@ -2179,8 +2478,9 @@ if (BUGBUG>1) dprintf(255, "[%.*s:%s] ", end ? (int)(end-start) : 0, start, ex ?
 
     // for/select/case require var name on same line, can't break segment yet
     if (!strcmp(s, "for") || !strcmp(s, "select") || !strcmp(s, "case")) {
-      if (!pl->type) pl->type = 1;
-      dlist_add(&sp->expect, (*s == 'c') ? "esac\0A" : "do\0A");
+// TODO why !pl->type here
+      if (!pl->type) pl->type = (*s == 'c') ? 128 : 1;
+      dlist_add(&sp->expect, (*s == 'c') ? "esac" : "do\0A");
 
       continue;
     }
@@ -2207,8 +2507,10 @@ if (BUGBUG>1) dprintf(255, "[%.*s:%s] ", end ? (int)(end-start) : 0, start, ex ?
 
     // If we got here we expect a specific word to end this block: is this it?
     else if (!strcmp(s, ex)) {
+      struct sh_arg *aa = pl->prev->arg;
+
       // can't "if | then" or "while && do", only ; & or newline works
-      if (last && strcmp(last, "&")) goto flush;
+      if (aa->v[aa->c] && strcmp(aa->v[aa->c], "&")) goto flush;
 
       // consume word, record block end location in earlier !0 type blocks
       free(dlist_lpop(&sp->expect));
@@ -2469,7 +2771,6 @@ TODO: a | b | c needs subshell for builtins?
       if (pipe_segments(ctl, pipes, &urd)) break;
     }
 
-if (BUGBUG) dprintf(255, "%d runtype=%d %s %s\n", getpid(), pl->type, s, ctl);
     // Is this an executable segment?
     if (!pl->type) {
 
@@ -2596,26 +2897,23 @@ dprintf(2, "TODO skipped init for((;;)), need math parser\n");
         } else if (strcmp(s, ";&")) {
           struct sh_arg arg = {0}, arg2 = {0};
 
-          for (err = 0, vv = 0; !err;) {
+          for (err = 0, vv = 0;;) {
             if (!vv) {
               vv = pl->arg->v + (**pl->arg->v == ';');
               if (!*vv) {
-                pl = pl->next;
-// TODO if not type==3 syntax err here, but catch it above
-
+                pl = pl->next; // TODO syntax err if not type==3, catch above
                 break;
               } else vv += **vv == '(';
             }
             arg.c = 0;
-            if (expand_arg_nobrace(&arg, *vv++, NO_PATH|NO_SPLIT, &blk->fdelete,
-              &arg2)) err = 1;
-            else {
-              match = wildcard_match(arg.c ? *arg.v : "", blk->fvar, &arg2);
-              if (match == 2) break;
-              else if (**vv++ == ')') {
-                vv = 0;
-                if ((pl = pl->end)->type!=2) break;
-              }
+            if ((err = expand_arg_nobrace(&arg, *vv++, NO_SPLIT, &blk->fdelete,
+              &arg2))) break;
+            s = arg.c ? *arg.v : "";
+            match = wildcard_match(blk->fvar, s, &arg2, 0);
+            if (match>=0 && !s[match]) break;
+            else if (**vv++ == ')') {
+              vv = 0;
+              if ((pl = pl->end)->type!=2) break;
             }
           }
           free(arg.v);
@@ -2676,10 +2974,12 @@ dprintf(2, "TODO skipped running for((;;)), need math parser\n");
     }
 
     // for && and || skip pipeline segment(s) based on return code
-    if (!pl->type || pl->type == 3)
-      while (ctl && !strcmp(ctl, toys.exitval ? "&&" : "||"))
-        ctl = (pl = pl->type ? pl->end : pl->next) ? pl->arg->v[pl->arg->c] : 0;
-
+    if (!pl->type || pl->type == 3) {
+      while (ctl && !strcmp(ctl, toys.exitval ? "&&" : "||")) {
+        if ((pl = pl->next)->type) pl = pl->end;
+        ctl = pl->arg->v[pl->arg->c];
+      }
+    }
     pl = pl->next;
   }
 
@@ -2872,6 +3172,21 @@ static void subshell_setup(void)
   xexit();
 }
 
+FILE *fpathopen(char *name)
+{
+  struct string_list *sl = 0;
+  FILE *f = fopen(name, "r");
+  char *pp = getvar("PATH") ? : _PATH_DEFPATH;
+
+  if (!f) {
+    for (sl = find_in_path(pp, *toys.optargs); sl; free(llist_pop(&sl)))
+      if ((f = fopen(sl->str, "r"))) break;
+    if (sl) llist_traverse(sl, free);
+  }
+
+  return f;
+}
+
 void sh_main(void)
 {
   char *new, *cc = TT.sh.c;
@@ -2900,8 +3215,6 @@ void sh_main(void)
 
   // if (!FLAG(noprofile)) { }
 
-if (BUGBUG) { int fd = open("/dev/tty", O_RDWR); if (fd == -1) fd = open("/dev/console", O_RDWR); if (fd == -1) dup2(2, 255); else dup2(fd, 255); close(fd); }
-
   // Is this an interactive shell?
   if (FLAG(s) || (!FLAG(c) && !toys.optc)) TT.options |= OPT_S;
   if (FLAG(i) || (!FLAG(c) && (TT.options&OPT_S) && isatty(0)))
@@ -2925,15 +3238,7 @@ if (BUGBUG) { int fd = open("/dev/tty", O_RDWR); if (fd == -1) fd = open("/dev/c
 // TODO unify fmemopen() here with sh_run
   if (cc) f = fmemopen(cc, strlen(cc), "r");
   else if (TT.options&OPT_S) f = stdin;
-// TODO: syntax_err should exit from shell scripts
-  else if (!(f = fopen(*toys.optargs, "r"))) {
-    char *pp = getvar("PATH") ? : _PATH_DEFPATH;
-
-    for (sl = find_in_path(pp, *toys.optargs); sl; free(llist_pop(&sl)))
-      if ((f = fopen(sl->str, "r"))) break;
-    if (sl) llist_traverse(sl->next, free);
-    else perror_exit_raw(*toys.optargs);
-  }
+  else if (!(f = fpathopen(*toys.optargs))) perror_exit_raw(*toys.optargs);
 
   // Loop prompting and reading lines
   for (;;) {
@@ -2953,7 +3258,6 @@ if (BUGBUG) { int fd = open("/dev/tty", O_RDWR); if (fd == -1) fd = open("/dev/c
 // SIGSTOP and SIGTSTP need need SA_RESTART, but child proc should stop
     }
 
-if (BUGBUG) dprintf(255, "line=%s\n", new);
     if (sl) {
       if (*new == 0x7f) error_exit("'%s' is ELF", sl->str);
       free(sl);
@@ -2962,9 +3266,7 @@ if (BUGBUG) dprintf(255, "line=%s\n", new);
 // TODO if (!isspace(*new)) add_to_history(line);
 
     // returns 0 if line consumed, command if it needs more data
-    prompt = parse_line(new, &scratch);
-if (BUGBUG) dprintf(255, "prompt=%d\n", prompt), dump_state(&scratch);
-    if (prompt != 1) {
+    if (1 != (prompt = parse_line(new, &scratch))) {
 // TODO: ./blah.sh one two three: put one two three in scratch.arg
       if (!prompt) run_function(scratch.pipeline);
       free_function(&scratch);
@@ -3130,6 +3432,7 @@ void exec_main(void)
 
   // report error (usually ENOENT) and return
   perror_msg("%s", TT.isexec);
+  if (*toys.optargs != TT.isexec) free(*toys.optargs);
   TT.isexec = 0;
   toys.exitval = 127;
   environ = old;
@@ -3229,6 +3532,47 @@ void shift_main(void)
 
   if (toys.optc) by = atolx(*toys.optargs);
   by += TT.shift;
-  if (by<0 || by>= TT.arg->c) toys.exitval++;
+  if (by<0 || by>=TT.arg->c) toys.exitval++;
   else TT.shift = by;
+}
+
+void source_main(void)
+{
+  struct sh_function scratch;
+  FILE *ff = fpathopen(*toys.optargs);
+  long lineno = TT.lineno, shift = TT.shift, prompt;
+  struct sh_arg arg, *old = TT.arg;
+  char *new;
+
+  if (!ff) return perror_msg_raw(*toys.optargs);
+
+  arg.c = toys.optc;
+  arg.v = toys.optargs;
+  TT.arg = &arg;
+  memset(&scratch, 0, sizeof(scratch));
+
+  // TODO: factor out and combine with sh_main() plumbing?
+  for (TT.lineno = TT.shift = 0;;) {
+    new = xgetline(ff, 0);
+    if (!TT.lineno++ && new && *new == 0x7f) {
+      error_msg("'%s' is ELF", *toys.optargs);
+      free(new);
+
+      break;
+    }
+    if (1!=(prompt = parse_line(new ? : " ", &scratch))) {
+      if (!prompt) run_function(scratch.pipeline);
+      free_function(&scratch);
+      if (!new) {
+        if (prompt) syntax_err("unexpected end of file");
+
+        break;
+      }
+    }
+    free(new);
+  }
+  fclose(ff);
+  TT.lineno = lineno;
+  TT.shift = shift;
+  TT.arg = old;
 }

@@ -346,6 +346,25 @@ int stridx(char *haystack, char needle)
   return off-haystack;
 }
 
+// Convert wc to utf8, returning bytes written. Does not null terminate.
+int wctoutf8(char *s, unsigned wc)
+{
+  int len = (wc>0x7ff)+(wc>0xffff), mask = 12+len+!!len;
+
+  if (wc<128) {
+    *s = wc;
+    return 1;
+  } else {
+    do {
+      s[1+len] = 0x80+(wc&0x3f);
+      wc >>= 7;
+    } while (len--);
+    *s = wc|mask;
+  }
+
+  return 2+len;
+}
+
 // Convert utf8 sequence to a unicode wide character
 // returns bytes consumed, or -1 if err, or -2 if need more data.
 int utf8towc(wchar_t *wc, char *str, unsigned len)
@@ -1148,18 +1167,24 @@ match:
 }
 
 // display first "dgt" many digits of number plus unit (kilo-exabytes)
-int human_readable_long(char *buf, unsigned long long num, int dgt, int style)
+int human_readable_long(char *buf, unsigned long long num, int dgt, int unit,
+  int style)
 {
   unsigned long long snap = 0;
-  int len, unit, divisor = (style&HR_1000) ? 1000 : 1024;
+  int len, divisor = (style&HR_1000) ? 1000 : 1024;
 
   // Divide rounding up until we have 3 or fewer digits. Since the part we
   // print is decimal, the test is 999 even when we divide by 1024.
-  // We can't run out of units because 1<<64 is 18 exabytes.
-  for (unit = 0; snprintf(0, 0, "%llu", num)>dgt; unit++)
+  // The largest unit we can detect is 1<<64 = 18 Exabytes, but we added
+  // Zettabyte and Yottabyte in case "unit" starts above zero.
+  for (;;unit++) {
+    if ((len = snprintf(0, 0, "%llu", num))<=dgt) break;
     num = ((snap = num)+(divisor/2))/divisor;
+  }
+  if (CFG_TOYBOX_DEBUG && unit>8) return sprintf(buf, "%.*s", dgt, "TILT");
+
   len = sprintf(buf, "%llu", num);
-  if (unit && len == 1) {
+  if (!(style & HR_NODOT) && unit && len == 1) {
     // Redo rounding for 1.2M case, this works with and without HR_1000.
     num = snap/divisor;
     snap -= num*divisor;
@@ -1169,7 +1194,7 @@ int human_readable_long(char *buf, unsigned long long num, int dgt, int style)
   }
   if (style & HR_SPACE) buf[len++] = ' ';
   if (unit) {
-    unit = " kMGTPE"[unit];
+    unit = " kMGTPEZY"[unit];
 
     if (!(style&HR_1000)) unit = toupper(unit);
     buf[len++] = unit;
@@ -1182,7 +1207,7 @@ int human_readable_long(char *buf, unsigned long long num, int dgt, int style)
 // Give 3 digit estimate + units ala 999M or 1.7T
 int human_readable(char *buf, unsigned long long num, int style)
 {
-  return human_readable_long(buf, num, 3, style);
+  return human_readable_long(buf, num, 3, 0, style);
 }
 
 // The qsort man page says you can use alphasort, the posix committee
